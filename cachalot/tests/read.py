@@ -6,11 +6,13 @@ from unittest import skipIf
 from uuid import UUID
 from decimal import Decimal
 
+from django import VERSION as django_version
 from django.contrib.auth.models import Group, Permission, User
 from django.contrib.contenttypes.models import ContentType
-from django.core.cache import cache
-from django.db import connection, transaction
-from django.db.models import Count
+from django.db import (
+    connection, transaction, DEFAULT_DB_ALIAS, ProgrammingError,
+    OperationalError)
+from django.db.models import Count, Q
 from django.db.models.expressions import RawSQL, Subquery, OuterRef, Exists
 from django.db.models.functions import Now
 from django.db.transaction import TransactionManagementError
@@ -18,9 +20,10 @@ from django.test import (
     TransactionTestCase, skipUnlessDBFeature, override_settings)
 from pytz import UTC
 
+from cachalot.cache import cachalot_caches
 from ..settings import cachalot_settings
 from ..utils import UncachableQuery
-from .models import Test, TestChild, TestParent
+from .models import Test, TestChild, TestParent, UnmanagedModel
 from .test_utils import TestUtilsMixin
 
 
@@ -480,6 +483,110 @@ class ReadTestCase(TestUtilsMixin, TransactionTestCase):
         self.assertListEqual(permissions8, permissions7)
         self.assertListEqual(permissions8, self.group__permissions)
 
+    @skipIf(django_version < (2, 0),
+            '`FilteredRelation` was introduced in Django 2.0.')
+    def test_filtered_relation(self):
+        from django.db.models import FilteredRelation
+
+        qs = TestChild.objects.annotate(
+            filtered_permissions=FilteredRelation(
+                'permissions', condition=Q(permissions__pk__gt=1)))
+        self.assert_tables(qs, TestChild)
+        self.assert_query_cached(qs)
+
+        values_qs = qs.values('filtered_permissions')
+        self.assert_tables(
+            values_qs, TestChild, TestChild.permissions.through, Permission)
+        self.assert_query_cached(values_qs)
+
+        filtered_qs = qs.filter(filtered_permissions__pk__gt=2)
+        self.assert_tables(
+            values_qs, TestChild, TestChild.permissions.through, Permission)
+        self.assert_query_cached(filtered_qs)
+
+    @skipUnlessDBFeature('supports_select_union')
+    def test_union(self):
+        qs = (Test.objects.filter(pk__lt=5)
+              | Test.objects.filter(permission__name__contains='a'))
+        self.assert_tables(qs, Test, Permission)
+        self.assert_query_cached(qs)
+
+        with self.assertRaisesMessage(
+                AssertionError,
+                'Cannot combine queries on two different base models.'):
+            Test.objects.all() | Permission.objects.all()
+
+        qs = Test.objects.filter(pk__lt=5)
+        sub_qs = Test.objects.filter(permission__name__contains='a')
+        if self.is_sqlite:
+            qs = qs.order_by()
+            sub_qs = sub_qs.order_by()
+        qs = qs.union(sub_qs)
+        self.assert_tables(qs, Test, Permission)
+        self.assert_query_cached(qs)
+
+        qs = Test.objects.all()
+        sub_qs = Permission.objects.all()
+        if self.is_sqlite:
+            qs = qs.order_by()
+            sub_qs = sub_qs.order_by()
+        qs = qs.union(sub_qs)
+        self.assert_tables(qs, Test, Permission)
+        with self.assertRaises((ProgrammingError, OperationalError)):
+            self.assert_query_cached(qs)
+
+    @skipUnlessDBFeature('supports_select_intersection')
+    def test_intersection(self):
+        qs = (Test.objects.filter(pk__lt=5)
+              & Test.objects.filter(permission__name__contains='a'))
+        self.assert_tables(qs, Test, Permission)
+        self.assert_query_cached(qs)
+
+        with self.assertRaisesMessage(
+                AssertionError,
+                'Cannot combine queries on two different base models.'):
+            Test.objects.all() & Permission.objects.all()
+
+        qs = Test.objects.filter(pk__lt=5)
+        sub_qs = Test.objects.filter(permission__name__contains='a')
+        if self.is_sqlite:
+            qs = qs.order_by()
+            sub_qs = sub_qs.order_by()
+        qs = qs.intersection(sub_qs)
+        self.assert_tables(qs, Test, Permission)
+        self.assert_query_cached(qs)
+
+        qs = Test.objects.all()
+        sub_qs = Permission.objects.all()
+        if self.is_sqlite:
+            qs = qs.order_by()
+            sub_qs = sub_qs.order_by()
+        qs = qs.intersection(sub_qs)
+        self.assert_tables(qs, Test, Permission)
+        with self.assertRaises((ProgrammingError, OperationalError)):
+            self.assert_query_cached(qs)
+
+    @skipUnlessDBFeature('supports_select_difference')
+    def test_difference(self):
+        qs = Test.objects.filter(pk__lt=5)
+        sub_qs = Test.objects.filter(permission__name__contains='a')
+        if self.is_sqlite:
+            qs = qs.order_by()
+            sub_qs = sub_qs.order_by()
+        qs = qs.difference(sub_qs)
+        self.assert_tables(qs, Test, Permission)
+        self.assert_query_cached(qs)
+
+        qs = Test.objects.all()
+        sub_qs = Permission.objects.all()
+        if self.is_sqlite:
+            qs = qs.order_by()
+            sub_qs = sub_qs.order_by()
+        qs = qs.difference(sub_qs)
+        self.assert_tables(qs, Test, Permission)
+        with self.assertRaises((ProgrammingError, OperationalError)):
+            self.assert_query_cached(qs)
+
     @skipUnlessDBFeature('has_select_for_update')
     def test_select_for_update(self):
         """
@@ -574,6 +681,39 @@ class ReadTestCase(TestUtilsMixin, TransactionTestCase):
         with self.assertNumQueries(0):
             self.assertEqual(TestChild.objects.get(), t_child)
 
+    @skipIf(django_version < (2, 1),
+            '`QuerySet.explain()` was introduced in Django 2.1.')
+    def test_explain(self):
+        explain_kwargs = {}
+        if self.is_sqlite:
+            expected = (r'0 0 0 SCAN TABLE cachalot_test\n'
+                        r'0 0 0 USE TEMP B-TREE FOR ORDER BY')
+        elif self.is_mysql:
+            expected = (
+                r'1 SIMPLE cachalot_test '
+                r'(?:None )?ALL None None None None 2 100\.0 Using filesort')
+        else:
+            explain_kwargs.update(
+                analyze=True,
+                costs=False,
+            )
+            operation_detail = (r'\(actual time=[\d\.]+..[\d\.]+\ '
+                                r'rows=\d+ loops=\d+\)')
+            expected = (
+                r'^Sort %s\n'
+                r'  Sort Key: name\n'
+                r'  Sort Method: quicksort  Memory: \d+kB\n'
+                r'  ->  Seq Scan on cachalot_test %s\n'
+                r'Planning time: [\d\.]+ ms\n'
+                r'Execution time: [\d\.]+ ms$') % (operation_detail,
+                                                   operation_detail)
+        with self.assertNumQueries(2 if self.is_mysql else 1):
+            explanation1 = Test.objects.explain(**explain_kwargs)
+        self.assertRegex(explanation1, expected)
+        with self.assertNumQueries(0):
+            explanation2 = Test.objects.explain(**explain_kwargs)
+        self.assertEqual(explanation2, explanation1)
+
     def test_raw(self):
         """
         Tests if ``Model.objects.raw`` queries are not cached.
@@ -667,7 +807,27 @@ class ReadTestCase(TestUtilsMixin, TransactionTestCase):
 
         table_cache_key = cachalot_settings.CACHALOT_TABLE_KEYGEN(
             connection.alias, Test._meta.db_table)
-        cache.delete(table_cache_key)
+        cachalot_caches.get_cache().delete(table_cache_key)
+
+        self.assert_query_cached(qs)
+
+    def test_broken_query_cache_value(self):
+        """
+        In some undetermined cases, cache.get_many return wrong values such
+        as `None` or other invalid values. They should be gracefully handled.
+        See https://github.com/noripyt/django-cachalot/issues/110
+
+        This test artificially creates a wrong value, but it’s usually
+        a cache backend bug that leads to these wrong values.
+        """
+        qs = Test.objects.all()
+        self.assert_tables(qs, Test)
+        self.assert_query_cached(qs)
+
+        query_cache_key = cachalot_settings.CACHALOT_QUERY_KEYGEN(
+            qs.query.get_compiler(DEFAULT_DB_ALIAS))
+        cachalot_caches.get_cache().set(query_cache_key, (),
+                                        cachalot_settings.CACHALOT_TIMEOUT)
 
         self.assert_query_cached(qs)
 
@@ -684,7 +844,7 @@ class ReadTestCase(TestUtilsMixin, TransactionTestCase):
         Tests if using unicode in table names does not break caching.
         """
         table_name = 'Clémentine'
-        if connection.vendor == 'postgresql':
+        if self.is_postgresql:
             table_name = '"%s"' % table_name
         with connection.cursor() as cursor:
             cursor.execute('CREATE TABLE %s (taste VARCHAR(20));' % table_name)
@@ -697,6 +857,11 @@ class ReadTestCase(TestUtilsMixin, TransactionTestCase):
         self.assert_query_cached(qs)
         with connection.cursor() as cursor:
             cursor.execute('DROP TABLE %s;' % table_name)
+
+    def test_unmanaged_model(self):
+        qs = UnmanagedModel.objects.all()
+        self.assert_tables(qs, UnmanagedModel)
+        self.assert_query_cached(qs)
 
 
 class ParameterTypeTestCase(TestUtilsMixin, TransactionTestCase):
